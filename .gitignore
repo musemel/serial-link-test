@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+*.pyc
+serial_test_*.log
