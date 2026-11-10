@@ -1,11 +1,12 @@
 """シリアル通信と、同一PC内のTCP通信を試験する。"""
 import argparse
-import hashlib
+import ctypes
 import logging
 import math
 import os
 import socket
 import sys
+import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -22,6 +23,9 @@ PROGRESS_SECONDS = 5
 HEADER_BYTES = 8
 MIN_SIZE = HEADER_BYTES + 1  # 16進の巡番号と改行を含む
 POLL_SECONDS = 0.2
+PATTERN = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+XON = 0x11
+XOFF = 0x13
 
 
 def options():
@@ -34,7 +38,7 @@ def options():
     parser.add_argument("--wait", type=float, help="巡間のウェイト秒数")
     parser.add_argument("--mode", choices=("send", "receive", "mutual"))
     parser.add_argument("--first", choices=("yes", "no"), help="交互モードで先に送るか")
-    parser.add_argument("--xonxoff", choices=("yes", "no"))
+    parser.add_argument("--xonxoff", choices=("yes", "no", "software"), help="OS制御 / 無効 / アプリで受信制御")
     parser.add_argument("--timeout", type=float, help="受信と送信のタイムアウト秒数")
     parser.add_argument("--dump-rx", action="store_true", help="受信した全バイトをログに記録")
     parser.add_argument("--display", choices=("progress", "round", "full"), default="round",
@@ -60,7 +64,7 @@ def options():
 
     if args.transport == "serial":
         args.com = fill("com", "COMポート番号", int, lambda v: v > 0)
-        args.xonxoff = fill("xonxoff", "XON/XOFF [yes/no]", str, ("yes", "no").__contains__)
+        args.xonxoff = fill("xonxoff", "XON/XOFF [yes/no/software]", str, ("yes", "no", "software").__contains__)
     elif not 1 <= args.tcp_port <= 65535:
         parser.error("--tcp-port は1～65535を指定してください")
     args.size = fill("size", f"1巡のバイト数 ({MIN_SIZE}以上、改行込み)", int, lambda v: v >= MIN_SIZE)
@@ -86,8 +90,46 @@ def frame(number, size):
     # 巡番号を明示し、受信側の途中参加とデータ欠落を区別する。
     header = f"{number:0{HEADER_BYTES}x}".encode("ascii")
     length = size - len(header) - 1
-    digest = hashlib.shake_256(header).hexdigest((length + 1) // 2)
-    return header + digest[:length].encode("ascii") + b"\n"
+    # 巡ごとに開始位置をずらし、指定サイズまでA～Zを繰り返す。
+    offset = (number - 1) % len(PATTERN)
+    pattern = PATTERN[offset:] + PATTERN[:offset]
+    repeats, tail = divmod(length, len(pattern))
+    return header + pattern * repeats + pattern[:tail] + b"\n"
+
+
+@contextmanager
+def monitor_flow(port, enabled):
+    """Windowsドライバーが報告した送信保留を、書き込み待ち中も監視する。"""
+    handle = getattr(port, "_port_handle", None)
+    if not enabled or handle is None or os.name != "nt":
+        yield
+        return
+    from serial import win32
+
+    stopped = threading.Event()
+
+    def observe():
+        flags = win32.DWORD()
+        status = win32.COMSTAT()
+        held = False
+        while not stopped.is_set():
+            if not win32.ClearCommError(handle, ctypes.byref(flags), ctypes.byref(status)):
+                logging.warning("FLOW Windowsドライバーの状態取得に失敗")
+                return
+            current = bool(status.fXoffHold)
+            if current != held:
+                held = current
+                logging.info("FLOW %s", "XOFFによる送信保留を検出" if held else "送信保留解除を検出")
+            stopped.wait(0.02)
+
+    observer = threading.Thread(target=observe, daemon=True)
+    observer.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        observer.join()
+
 
 
 def frame_number(data):
@@ -109,7 +151,8 @@ def connect(args):
             timeout=min(POLL_SECONDS, args.timeout), write_timeout=args.timeout,
             xonxoff=args.xonxoff == "yes",
         ) as port:
-            yield port
+            with monitor_flow(port, args.xonxoff == "yes"):
+                yield port
         return
 
     address = ("127.0.0.1", args.tcp_port)
@@ -148,6 +191,27 @@ class Link:
         self.tcp = args.transport == "tcp"
         self.timeout = args.timeout
         self.pending = bytearray()
+        self.controls = Counter()
+        self.dump_rx = args.dump_rx
+        self.software_flow = not self.tcp and args.xonxoff == "software"
+        self.paused = False
+
+    def serial_data(self, chunk):
+        # 制御文字を受信順に処理し、試験データから分離する。
+        for byte, label in ((XON, "XON"), (XOFF, "XOFF")):
+            count = chunk.count(bytes((byte,)))
+            if count:
+                if not self.controls[label]:
+                    logging.info("FLOW %sを読み取りで観測（データ集計から除外）", label)
+                self.controls[label] += count
+        if self.dump_rx and (XON in chunk or XOFF in chunk):
+            logging.debug("FLOW 制御文字を含む読み取り全量 %r", chunk)
+        if self.software_flow:
+            for byte in chunk:
+                if byte in (XON, XOFF) and self.paused != (byte == XOFF):
+                    self.paused = byte == XOFF
+                    logging.info("FLOW アプリ %s", "XOFFで送信保留" if self.paused else "XONで送信再開")
+        return chunk.translate(None, bytes((XON, XOFF)))
 
     def send(self, data):
         if self.tcp:
@@ -155,6 +219,23 @@ class Link:
             self.port.sendall(data)
             return
         deadline = time.monotonic() + self.timeout
+        # アプリ制御時は小分けに送信し、次の書き込み前に制御文字を処理する。
+        if self.software_flow:
+            for start in range(0, len(data), 64):
+                while True:
+                    available = self.port.in_waiting
+                    if available:
+                        self.pending.extend(self.serial_data(self.port.read(min(available, 65536))))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("XON待ちがタイムアウト" if self.paused else "送信がタイムアウト")
+                    if not self.paused and not self.port.out_waiting:
+                        break
+                    time.sleep(0.005)
+                self.write_serial(data[start:start + 64], deadline)
+            return
+        self.write_serial(data, deadline)
+
+    def write_serial(self, data, deadline):
         written = self.port.write(data)
         if written != len(data):
             raise OSError(f"部分書き込み {written}/{len(data)} bytes")
@@ -188,6 +269,7 @@ class Link:
                 closed = not chunk
             else:
                 chunk = self.port.read(min(self.port.in_waiting or 1, 65536))
+                chunk = self.serial_data(chunk)
             self.pending.extend(chunk)
 
 
@@ -204,7 +286,8 @@ def verdict(data, expected, closed):
         return "SHORT", f"不足={len(expected) - len(data)} bytes"
     if len(data) > len(expected):
         return "LONG", "受信長超過"
-    return "MISMATCH", "内容不一致"
+    index = next(i for i, (actual, wanted) in enumerate(zip(data, expected)) if actual != wanted)
+    return "MISMATCH", f"先頭不一致位置={index + 1} 期待=0x{expected[index]:02X} 実際=0x{data[index]:02X}"
 
 
 def run(link, args, totals):
@@ -314,7 +397,13 @@ def main():
     exit_code = 0
     try:
         with connect(args) as port:
-            run(Link(port, args), args, totals)
+            link = Link(port, args)
+            try:
+                run(link, args, totals)
+            finally:
+                if args.transport == "serial":
+                    logging.info("FLOW アプリで観測した制御文字 XON=%d XOFF=%d",
+                                 link.controls["XON"], link.controls["XOFF"])
         exit_code = int(any(count for (_, status), count in totals.items()
                             if status not in ("OK", "SKIP")))
     except KeyboardInterrupt:
